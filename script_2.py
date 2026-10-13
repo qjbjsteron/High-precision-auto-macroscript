@@ -8,7 +8,7 @@ import asyncio
 
 
 async def run():
-    print("执行了图片2对应的脚本！")
+    print("执行了图片2对应的脚本！执行了图片2对应的脚本！")
     # 示例：
     # from script_runtime import key_tap
     # await key_tap("f", after=0.1)
