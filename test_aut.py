@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import contextvars
 import gc
 import sys
 import threading
@@ -36,8 +37,12 @@ from script_runtime import (
 import script_1
 import script_2
 
-# 功能 1：按键触发模式使用的脚本
-KEY_TRIGGER_SCRIPT = script_1.run
+# 功能 1：按键触发模式 —— 按键 -> 脚本。
+# 按键支持字母、数字，以及 pynput 能识别的小写按键名（如 "f1"、"space"）。
+KEY_TRIGGER_SCRIPTS = {
+    "c": script_1.run,
+    "v": script_2.run,
+}
 
 # 功能 3：图像顺序检测 —— 检测器名称 -> 脚本（步骤顺序见下方 SEQUENCE_STEPS）
 SEQUENCE_TRIGGER_SCRIPTS = {
@@ -63,7 +68,8 @@ def _lookup_script(script_map, detector_name, mode_name):
 # 可修改热键
 STOP_HOTKEY = "x"                # 停止热键，所有模式有效
 DEBUG_SNAPSHOT_HOTKEY = "p"      # 手动截图调试热键，所有模式有效
-TRIGGER_HOTKEY = "c"             # 按键触发模式下的执行热键
+STOP_HOTKEY = str(STOP_HOTKEY).strip().lower()
+DEBUG_SNAPSHOT_HOTKEY = str(DEBUG_SNAPSHOT_HOTKEY).strip().lower()
 
 TRIGGER_LOOP_DELAY = 0.1         # 按住循环模式下，两次脚本执行之间的间隔
 
@@ -71,6 +77,43 @@ TRIGGER_LOOP_DELAY = 0.1         # 按住循环模式下，两次脚本执行之
 KEY_MODE_FULL = "full"
 KEY_MODE_HOLD = "hold"
 KEY_MODE_HOLD_LOOP = "hold_loop"
+
+
+def _prepare_key_trigger_scripts(bindings):
+    """统一按键名称并检查冲突，方便按键映射直接写在顶部字典中。"""
+    prepared = {}
+    reserved = {
+        str(STOP_HOTKEY).strip().lower(),
+        str(DEBUG_SNAPSHOT_HOTKEY).strip().lower(),
+    }
+    for key, script in bindings.items():
+        key_name = str(key).strip().lower()
+        if not key_name:
+            raise ValueError("按键触发配置中存在空按键。")
+        if key_name in reserved:
+            raise ValueError(f"按键触发配置不能使用保留热键 '{key_name}'。")
+        if key_name in prepared:
+            raise ValueError(f"按键触发配置中存在重复按键 '{key_name}'。")
+        if not callable(script):
+            raise TypeError(f"按键 '{key_name}' 绑定的脚本不可调用。")
+        prepared[key_name] = script
+    return prepared
+
+
+KEY_TRIGGER_SCRIPTS = _prepare_key_trigger_scripts(KEY_TRIGGER_SCRIPTS)
+
+
+def _script_display_name(script):
+    module = getattr(script, "__module__", "")
+    name = getattr(script, "__name__", repr(script))
+    return f"{module}.{name}" if module else name
+
+
+def _describe_key_bindings():
+    return ", ".join(
+        f"'{key_name}' -> {_script_display_name(script)}"
+        for key_name, script in KEY_TRIGGER_SCRIPTS.items()
+    )
 
 # 图片检测配置
 DETECTION_INTERVAL = 0.01        # 每次检测之间的间隔，越小响应越快、CPU 占用越高
@@ -92,8 +135,9 @@ running_tasks = set()
 main_loop = None
 current_mode = None
 key_run_mode = KEY_MODE_FULL
-trigger_key_is_down = False
-active_hold_task = None
+active_trigger_keys = set()
+active_hold_tasks = {}
+_trigger_key_context = contextvars.ContextVar("trigger_key", default=None)
 
 # 检测任务固定放在一个工作线程中执行，复用 MSS 会话。
 detection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-detector")
@@ -105,11 +149,14 @@ def _action_cancel_requested():
     """停止热键按下，或按住模式松开触发键时，让精确延时立即取消当前动作。"""
     if stop_event.is_set():
         return True
-    return (
+    if (
         current_mode == "key"
         and key_run_mode in (KEY_MODE_HOLD, KEY_MODE_HOLD_LOOP)
-        and not trigger_key_is_down
-    )
+    ):
+        trigger_key = _trigger_key_context.get()
+        if trigger_key is not None:
+            return trigger_key not in active_trigger_keys
+    return False
 
 
 set_cancel_checker(_action_cancel_requested)
@@ -145,12 +192,14 @@ ACTUAL_SCREEN_RESOLUTION = get_virtual_screen_size()
 
 
 # ===================== 任务管理 =====================
-async def run_action(action):
+async def run_action(action, trigger_key=None):
     """串行执行动作，并在任何退出路径上释放残留的键鼠输入。"""
     global action_lock
     if action_lock is None:
         action_lock = asyncio.Lock()
 
+    # 把触发按键绑定到当前任务，按住模式松开时只取消对应按键的任务。
+    context_token = _trigger_key_context.set(trigger_key)
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
         gc.disable()
@@ -168,10 +217,11 @@ async def run_action(action):
     finally:
         if gc_was_enabled:
             gc.enable()
+        _trigger_key_context.reset(context_token)
 
 
-def create_action_task(action_coro):
-    task = asyncio.create_task(run_action(action_coro))
+def create_action_task(action_coro, trigger_key=None):
+    task = asyncio.create_task(run_action(action_coro, trigger_key))
     running_tasks.add(task)
     task.add_done_callback(running_tasks.discard)
     return task
@@ -732,7 +782,8 @@ async def wait_for_stop():
 
 async def run_application(mode):
     if mode == "key":
-        print(f"按下 '{TRIGGER_HOTKEY}' 键将执行脚本操作。")
+        print(f"按键绑定：{_describe_key_bindings()}")
+        print("按下对应按键将执行绑定的脚本。")
         await wait_for_stop()
     elif mode == "logic":
         await logic_image_loop()
@@ -758,63 +809,78 @@ def _schedule_debug_capture():
         asyncio.create_task(capture_all_regions())
 
 
-async def _run_trigger_action_loop():
-    while not stop_event.is_set():
+async def _run_trigger_action_loop(trigger_key, script):
+    while not stop_event.is_set() and trigger_key in active_trigger_keys:
         try:
-            await KEY_TRIGGER_SCRIPT()
+            await script()
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            print(f"[按键模式] 循环执行脚本失败: {ex}")
+            print(f"[按键模式] 按键 '{trigger_key}' 循环执行脚本失败: {ex}")
         await precise_sleep(TRIGGER_LOOP_DELAY)
 
 
-def _clear_active_hold_task(task):
-    global active_hold_task
-    if active_hold_task is task:
-        active_hold_task = None
+def _clear_active_hold_task(trigger_key, task):
+    if active_hold_tasks.get(trigger_key) is task:
+        active_hold_tasks.pop(trigger_key, None)
 
 
-def _track_active_hold_task(task):
-    global active_hold_task
-    active_hold_task = task
-    task.add_done_callback(_clear_active_hold_task)
+def _track_active_hold_task(trigger_key, task):
+    active_hold_tasks[trigger_key] = task
+    task.add_done_callback(
+        lambda done_task: _clear_active_hold_task(trigger_key, done_task)
+    )
 
 
-def _start_trigger_action():
+def _start_trigger_action(trigger_key, script):
     if stop_event.is_set():
         return
 
+    # 按下事件和松开事件可能跨线程先后到达，启动前再次确认按键仍按下。
+    if trigger_key not in active_trigger_keys:
+        return
+
     if key_run_mode == KEY_MODE_FULL:
-        create_action_task(KEY_TRIGGER_SCRIPT())
+        create_action_task(script(), trigger_key)
         return
 
-    # 松开事件可能先于这个回调被事件循环处理，此时不应再启动按住任务。
-    if not trigger_key_is_down:
-        return
-
-    if active_hold_task is not None and not active_hold_task.done():
+    existing_task = active_hold_tasks.get(trigger_key)
+    if existing_task is not None and not existing_task.done():
         return
 
     if key_run_mode == KEY_MODE_HOLD:
-        _track_active_hold_task(create_action_task(KEY_TRIGGER_SCRIPT()))
+        task = create_action_task(script(), trigger_key)
     elif key_run_mode == KEY_MODE_HOLD_LOOP:
-        _track_active_hold_task(create_action_task(_run_trigger_action_loop()))
+        task = create_action_task(
+            _run_trigger_action_loop(trigger_key, script), trigger_key
+        )
+    else:
+        return
+    _track_active_hold_task(trigger_key, task)
 
 
-def _stop_trigger_action():
-    global active_hold_task
-    if active_hold_task is not None and not active_hold_task.done():
-        active_hold_task.cancel()
-        active_hold_task = None
+def _stop_trigger_action(trigger_key):
+    task = active_hold_tasks.pop(trigger_key, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _get_event_key_name(key):
+    """统一键盘监听事件中的字符键和功能键名称。"""
+    char = getattr(key, "char", None)
+    if char:
+        return char.lower()
+    name = getattr(key, "name", None)
+    if name:
+        return name.lower()
+    return None
 
 
 def on_press(key):
-    global trigger_key_is_down
     try:
-        char = key.char.lower() if hasattr(key, "char") and key.char else None
+        key_name = _get_event_key_name(key)
 
-        if char == STOP_HOTKEY:
+        if key_name == STOP_HOTKEY:
             if stop_event.is_set():
                 return
             print(f"[停止] 检测到停止热键 '{STOP_HOTKEY}'，正在停止...")
@@ -823,7 +889,7 @@ def on_press(key):
                 main_loop.call_soon_threadsafe(cancel_running_actions)
             return
 
-        if char == DEBUG_SNAPSHOT_HOTKEY:
+        if key_name == DEBUG_SNAPSHOT_HOTKEY:
             if not _hotkey_allowed("debug_snapshot"):
                 return
             print(f"[调试截图] 检测到热键 '{DEBUG_SNAPSHOT_HOTKEY}'，开始对检测区域截图...")
@@ -831,27 +897,29 @@ def on_press(key):
                 main_loop.call_soon_threadsafe(_schedule_debug_capture)
             return
 
-        if char == TRIGGER_HOTKEY:
-            if trigger_key_is_down:
-                return
-            trigger_key_is_down = True
-            if current_mode != "key" or stop_event.is_set():
-                return
-            print(f"[按键模式] 检测到按下 {TRIGGER_HOTKEY}，开始执行操作。")
-            if main_loop is not None and main_loop.is_running():
-                main_loop.call_soon_threadsafe(_start_trigger_action)
+        script = KEY_TRIGGER_SCRIPTS.get(key_name)
+        if script is None:
+            return
+        if current_mode != "key" or stop_event.is_set():
+            return
+        if key_name in active_trigger_keys:
+            return
+
+        active_trigger_keys.add(key_name)
+        print(f"[按键模式] 检测到按下 '{key_name}'，开始执行对应脚本。")
+        if main_loop is not None and main_loop.is_running():
+            main_loop.call_soon_threadsafe(_start_trigger_action, key_name, script)
     except Exception as ex:
         print(f"[错误] 键盘监听异常: {ex}")
 
 
 def on_release(key):
-    global trigger_key_is_down
     try:
-        char = key.char.lower() if hasattr(key, "char") and key.char else None
-        if char != TRIGGER_HOTKEY:
+        key_name = _get_event_key_name(key)
+        if key_name not in KEY_TRIGGER_SCRIPTS:
             return
 
-        trigger_key_is_down = False
+        active_trigger_keys.discard(key_name)
         if current_mode != "key":
             return
         if key_run_mode not in (KEY_MODE_HOLD, KEY_MODE_HOLD_LOOP):
@@ -859,9 +927,9 @@ def on_release(key):
         if stop_event.is_set():
             return
 
-        print(f"[按键模式] 检测到松开 {TRIGGER_HOTKEY}，停止当前执行。")
+        print(f"[按键模式] 检测到松开 '{key_name}'，停止该按键的脚本。")
         if main_loop is not None and main_loop.is_running():
-            main_loop.call_soon_threadsafe(_stop_trigger_action)
+            main_loop.call_soon_threadsafe(_stop_trigger_action, key_name)
     except Exception as ex:
         print(f"[错误] 键盘监听异常: {ex}")
 
@@ -883,10 +951,10 @@ def select_mode():
 
 
 def select_key_run_mode():
-    print("请选择按键触发方式：")
-    print(f"1. 按下 {TRIGGER_HOTKEY}，执行完整脚本")
-    print(f"2. 按住 {TRIGGER_HOTKEY} 执行，松开停止")
-    print(f"3. 按住 {TRIGGER_HOTKEY} 循环执行，松开停止")
+    print("请选择按键触发方式（对所有绑定按键生效）：")
+    print("1. 按下触发键，执行完整脚本")
+    print("2. 按住触发键执行，松开对应按键停止")
+    print("3. 按住触发键循环执行，松开对应按键停止")
     while True:
         choice = input("请输入 1、2 或 3: ").strip()
         if choice == "1":
@@ -900,13 +968,13 @@ def select_key_run_mode():
 
 def main():
     global current_mode, main_loop, key_run_mode
-    global trigger_key_is_down, active_hold_task
+    global active_trigger_keys, active_hold_tasks
 
     mode = select_mode()
     key_run_mode = select_key_run_mode() if mode == "key" else None
     current_mode = mode
-    trigger_key_is_down = False
-    active_hold_task = None
+    active_trigger_keys = set()
+    active_hold_tasks = {}
     stop_event.clear()
     _last_hotkey_times.clear()
 
@@ -914,13 +982,14 @@ def main():
     print(f"  - 停止热键: '{STOP_HOTKEY}'")
     print(f"  - 调试截图热键: '{DEBUG_SNAPSHOT_HOTKEY}'（保存到 {DEBUG_SCREENSHOT_DIR}）")
     if mode == "key":
-        print(f"  - 执行热键: '{TRIGGER_HOTKEY}'")
+        for key_name, script in KEY_TRIGGER_SCRIPTS.items():
+            print(f"  - 按键 '{key_name}' -> {_script_display_name(script)}")
         if key_run_mode == KEY_MODE_FULL:
             print("  - 触发方式: 按下执行完整脚本，松开不影响执行")
         elif key_run_mode == KEY_MODE_HOLD:
-            print("  - 触发方式: 按住执行，松开停止")
+            print("  - 触发方式: 按住执行，松开对应按键停止")
         else:
-            print("  - 触发方式: 按住循环执行，松开停止")
+            print("  - 触发方式: 按住循环执行，松开对应按键停止")
 
     main_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(main_loop)
