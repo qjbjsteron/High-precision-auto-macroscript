@@ -56,7 +56,7 @@ async def run():
         await key_tap(Key.shift, hold=0.02, after=0.08)
         await key_tap(H, hold=0.01, after=0.05)
 
-    for _ in range(6):
+    for _ in range(7):
         await key_tap(E, hold=0.01, after=0.26)
 
         for _ in range(6):

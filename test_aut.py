@@ -32,7 +32,7 @@ from script_runtime import (
 #   1) 复制 script_1.py 改名为 script_3.py，编写 async def run()
 #   2) 在下方导入该模块
 #   3) 把对应功能的脚本改成 script_3.run
-#########################
+#
 import script_1
 import script_2
 
